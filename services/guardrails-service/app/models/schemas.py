@@ -260,12 +260,29 @@ class BatchGenerateRequest(UserRequest):
     )
 
 
+class BatchItemResult(BaseModel):
+    """Result of a single item in batch generation."""
+    index: int = Field(..., description="Index of this item in the original request list")
+    success: bool = Field(..., description="Whether this item was processed successfully")
+    result: Optional[GuardrailGenerationResponse] = Field(
+        default=None, description="Generation result (if successful)"
+    )
+    error: Optional[str] = Field(
+        default=None, description="Error message (if failed)"
+    )
+    error_type: Optional[str] = Field(
+        default=None, description="Error type/category (if failed)"
+    )
+
+
 class BatchGenerateResponse(BaseModel):
-    """Response for batch generation."""
-    results: List[GuardrailGenerationResponse]
-    total: int
-    successful: int
-    failed: int
+    """Response for batch generation with per-item tracking."""
+    results: List[BatchItemResult] = Field(
+        ..., description="Results for each item, preserving original order"
+    )
+    total: int = Field(..., description="Total number of items in request")
+    successful: int = Field(..., description="Number of successful items")
+    failed: int = Field(..., description="Number of failed items")
 
 
 # ============================================================================

@@ -1,5 +1,5 @@
 # Project Structure Documentation
-Generated: 2026-01-19 10:38:45.989114
+Generated: 2026-01-20 04:09:23.320973
 
 
 ## services/guardrails-service

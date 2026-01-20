@@ -3,6 +3,7 @@ Repository for GuardrailGeneration CRUD operations.
 Handles database access for guardrail generations.
 """
 
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 from sqlalchemy import select, func
@@ -80,6 +81,8 @@ class GenerationRepository:
         """
         Get a generation by ID and user (for access control).
 
+        Excludes soft-deleted records.
+
         Args:
             generation_id: Generation UUID
             user_id: User ID
@@ -91,6 +94,7 @@ class GenerationRepository:
             select(GuardrailGeneration).where(
                 GuardrailGeneration.id == generation_id,
                 GuardrailGeneration.user_id == user_id,
+                GuardrailGeneration.is_deleted == False,
             )
         )
         return result.scalar_one_or_none()
@@ -101,6 +105,7 @@ class GenerationRepository:
         page: int = 1,
         page_size: int = 20,
         template_key: Optional[str] = None,
+        include_deleted: bool = False,
     ) -> tuple[List[GuardrailGeneration], int]:
         """
         List generations for a user with pagination and filtering.
@@ -110,12 +115,17 @@ class GenerationRepository:
             page: Page number (1-indexed)
             page_size: Number of items per page
             template_key: Optional template key filter
+            include_deleted: Whether to include soft-deleted records (default False)
 
         Returns:
             tuple: (list of generations, total count)
         """
         # Build query
         query = select(GuardrailGeneration).where(GuardrailGeneration.user_id == user_id)
+
+        # Exclude soft-deleted by default
+        if not include_deleted:
+            query = query.where(GuardrailGeneration.is_deleted == False)
 
         if template_key:
             query = query.where(GuardrailGeneration.template_key == template_key)
@@ -137,9 +147,58 @@ class GenerationRepository:
 
         return list(items), total
 
-    async def delete(self, generation_id: UUID) -> bool:
+    async def delete(self, generation_id: UUID, deleted_by: Optional[str] = None) -> bool:
         """
-        Delete a generation.
+        Soft delete a generation (mark as deleted, don't physically remove).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            generation_id: Generation UUID
+            deleted_by: User ID who performed the deletion
+
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        generation = await self.get_by_id(generation_id)
+        if not generation:
+            return False
+
+        generation.is_deleted = True
+        generation.deleted_at = datetime.utcnow()
+        generation.deleted_by = deleted_by
+        await self.db.commit()
+        return True
+
+    async def delete_by_user(self, generation_id: UUID, user_id: str) -> bool:
+        """
+        Soft delete a generation (user-scoped for access control).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            generation_id: Generation UUID
+            user_id: User ID (also recorded as deleted_by)
+
+        Returns:
+            bool: True if deleted, False if not found or access denied
+        """
+        generation = await self.get_by_id_and_user(generation_id, user_id)
+        if not generation:
+            return False
+
+        generation.is_deleted = True
+        generation.deleted_at = datetime.utcnow()
+        generation.deleted_by = user_id
+        await self.db.commit()
+        return True
+
+    async def hard_delete(self, generation_id: UUID) -> bool:
+        """
+        Permanently delete a generation (use with caution - for admin/cleanup only).
+
+        WARNING: This permanently removes the record and cannot be undone.
+        Use soft delete (delete_by_user) for normal operations.
 
         Args:
             generation_id: Generation UUID
@@ -155,24 +214,34 @@ class GenerationRepository:
         await self.db.commit()
         return True
 
-    async def delete_by_user(self, generation_id: UUID, user_id: str) -> bool:
+    async def restore(self, generation_id: UUID, user_id: str) -> Optional[GuardrailGeneration]:
         """
-        Delete a generation (user-scoped for access control).
+        Restore a soft-deleted generation.
 
         Args:
             generation_id: Generation UUID
-            user_id: User ID
+            user_id: User ID for access control
 
         Returns:
-            bool: True if deleted, False if not found or access denied
+            Optional[GuardrailGeneration]: Restored generation or None if not found
         """
-        generation = await self.get_by_id_and_user(generation_id, user_id)
+        result = await self.db.execute(
+            select(GuardrailGeneration).where(
+                GuardrailGeneration.id == generation_id,
+                GuardrailGeneration.user_id == user_id,
+                GuardrailGeneration.is_deleted == True,
+            )
+        )
+        generation = result.scalar_one_or_none()
         if not generation:
-            return False
+            return None
 
-        await self.db.delete(generation)
+        generation.is_deleted = False
+        generation.deleted_at = None
+        generation.deleted_by = None
         await self.db.commit()
-        return True
+        await self.db.refresh(generation)
+        return generation
 
     async def count_by_user(self, user_id: str, template_key: Optional[str] = None) -> int:
         """

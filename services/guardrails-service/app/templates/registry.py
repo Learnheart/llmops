@@ -4,7 +4,7 @@ Implements the Factory pattern for guardrail creation.
 """
 
 from typing import Dict, List
-from app.templates.base import GuardrailStrategy
+from app.templates.base import GuardrailStrategy, InvalidParameterError
 from app.templates.content_safety import ContentSafetyStrategy
 from app.templates.pii_protection import PIIProtectionStrategy
 from app.templates.factual_accuracy import FactualAccuracyStrategy

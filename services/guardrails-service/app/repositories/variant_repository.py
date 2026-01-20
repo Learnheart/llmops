@@ -3,6 +3,7 @@ Repository for GuardrailVariant CRUD operations.
 Handles database access for guardrail variants with versioning.
 """
 
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 from sqlalchemy import select, func, or_
@@ -67,6 +68,55 @@ class VariantRepository:
         await self.db.refresh(variant)
         return variant
 
+    async def create_with_version(
+        self,
+        generation_id: UUID,
+        user_id: str,
+        name: str,
+        guardrail_content: str,
+        version: int,
+        description: Optional[str] = None,
+        status: VariantStatus = VariantStatus.DRAFT,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[dict] = None,
+    ) -> GuardrailVariant:
+        """
+        Create a new guardrail variant with explicit version number.
+
+        Use this method within a transaction that has already locked
+        to get the next version number (prevents race conditions).
+
+        Args:
+            generation_id: ID of the parent generation
+            user_id: ID of the user creating the variant
+            name: Variant name
+            guardrail_content: Guardrail content
+            version: Explicit version number
+            description: Optional description
+            status: Initial status
+            tags: Optional tags
+            metadata: Additional metadata
+
+        Returns:
+            GuardrailVariant: Created variant instance (not committed)
+        """
+        variant = GuardrailVariant(
+            generation_id=generation_id,
+            user_id=user_id,
+            name=name,
+            description=description,
+            guardrail_content=guardrail_content,
+            version=version,
+            is_active=True,
+            status=status,
+            tags=tags,
+            metadata=metadata,
+        )
+        self.db.add(variant)
+        # Don't commit here - let the caller manage the transaction
+        await self.db.flush()
+        return variant
+
     async def get_by_id(self, variant_id: UUID) -> Optional[GuardrailVariant]:
         """
         Get a variant by ID.
@@ -103,6 +153,56 @@ class VariantRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_id_and_user_for_update(
+        self, variant_id: UUID, user_id: str
+    ) -> Optional[GuardrailVariant]:
+        """
+        Get a variant by ID and user with row-level lock (FOR UPDATE).
+
+        Use this method when creating new versions to prevent race conditions.
+        The lock is held until the transaction commits/rollbacks.
+
+        Args:
+            variant_id: Variant UUID
+            user_id: User ID
+
+        Returns:
+            Optional[GuardrailVariant]: Variant if found and belongs to user, None otherwise
+        """
+        result = await self.db.execute(
+            select(GuardrailVariant)
+            .where(
+                GuardrailVariant.id == variant_id,
+                GuardrailVariant.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def get_max_version_for_generation(
+        self, generation_id: UUID, user_id: str
+    ) -> int:
+        """
+        Get the maximum version number for a generation (with lock).
+
+        Args:
+            generation_id: Generation UUID
+            user_id: User ID
+
+        Returns:
+            int: Maximum version number, 0 if no variants exist
+        """
+        result = await self.db.execute(
+            select(func.max(GuardrailVariant.version))
+            .where(
+                GuardrailVariant.generation_id == generation_id,
+                GuardrailVariant.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        max_version = result.scalar_one_or_none()
+        return max_version or 0
+
     async def list_by_user(
         self,
         user_id: str,
@@ -112,6 +212,8 @@ class VariantRepository:
         status: Optional[VariantStatus] = None,
         is_active: Optional[bool] = None,
         tags: Optional[List[str]] = None,
+        tags_match: str = "any",
+        include_deleted: bool = False,
     ) -> tuple[List[GuardrailVariant], int]:
         """
         List variants for a user with pagination and filtering.
@@ -123,13 +225,19 @@ class VariantRepository:
             generation_id: Optional generation ID filter
             status: Optional status filter
             is_active: Optional active state filter
-            tags: Optional tags filter (matches any tag)
+            tags: Optional tags filter
+            tags_match: "any" (OR logic) or "all" (AND logic)
+            include_deleted: Whether to include soft-deleted records
 
         Returns:
             tuple: (list of variants, total count)
         """
         # Build query
         query = select(GuardrailVariant).where(GuardrailVariant.user_id == user_id)
+
+        # Exclude soft-deleted by default
+        if not include_deleted:
+            query = query.where(GuardrailVariant.is_deleted == False)
 
         if generation_id:
             query = query.where(GuardrailVariant.generation_id == generation_id)
@@ -141,11 +249,16 @@ class VariantRepository:
             query = query.where(GuardrailVariant.is_active == is_active)
 
         if tags:
-            # Match any of the provided tags (JSON array overlap)
-            tag_conditions = [
-                GuardrailVariant.tags.contains([tag]) for tag in tags
-            ]
-            query = query.where(or_(*tag_conditions))
+            if tags_match == "all":
+                # AND logic - must have ALL tags
+                for tag in tags:
+                    query = query.where(GuardrailVariant.tags.contains([tag]))
+            else:
+                # OR logic (default) - have ANY of the tags
+                tag_conditions = [
+                    GuardrailVariant.tags.contains([tag]) for tag in tags
+                ]
+                query = query.where(or_(*tag_conditions))
 
         # Get total count
         count_query = select(func.count()).select_from(query.subquery())
@@ -247,9 +360,58 @@ class VariantRepository:
         await self.db.refresh(variant)
         return variant
 
-    async def delete(self, variant_id: UUID) -> bool:
+    async def delete(self, variant_id: UUID, deleted_by: Optional[str] = None) -> bool:
         """
-        Delete a variant.
+        Soft delete a variant (mark as deleted, don't physically remove).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            variant_id: Variant UUID
+            deleted_by: User ID who performed the deletion
+
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        variant = await self.get_by_id(variant_id)
+        if not variant:
+            return False
+
+        variant.is_deleted = True
+        variant.deleted_at = datetime.utcnow()
+        variant.deleted_by = deleted_by
+        await self.db.commit()
+        return True
+
+    async def delete_by_user(self, variant_id: UUID, user_id: str) -> bool:
+        """
+        Soft delete a variant (user-scoped for access control).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            variant_id: Variant UUID
+            user_id: User ID (also recorded as deleted_by)
+
+        Returns:
+            bool: True if deleted, False if not found or access denied
+        """
+        variant = await self.get_by_id_and_user(variant_id, user_id)
+        if not variant:
+            return False
+
+        variant.is_deleted = True
+        variant.deleted_at = datetime.utcnow()
+        variant.deleted_by = user_id
+        await self.db.commit()
+        return True
+
+    async def hard_delete(self, variant_id: UUID) -> bool:
+        """
+        Permanently delete a variant (use with caution - for admin/cleanup only).
+
+        WARNING: This permanently removes the record and cannot be undone.
+        Use soft delete (delete_by_user) for normal operations.
 
         Args:
             variant_id: Variant UUID
@@ -265,24 +427,34 @@ class VariantRepository:
         await self.db.commit()
         return True
 
-    async def delete_by_user(self, variant_id: UUID, user_id: str) -> bool:
+    async def restore(self, variant_id: UUID, user_id: str) -> Optional[GuardrailVariant]:
         """
-        Delete a variant (user-scoped for access control).
+        Restore a soft-deleted variant.
 
         Args:
             variant_id: Variant UUID
-            user_id: User ID
+            user_id: User ID for access control
 
         Returns:
-            bool: True if deleted, False if not found or access denied
+            Optional[GuardrailVariant]: Restored variant or None if not found
         """
-        variant = await self.get_by_id_and_user(variant_id, user_id)
+        result = await self.db.execute(
+            select(GuardrailVariant).where(
+                GuardrailVariant.id == variant_id,
+                GuardrailVariant.user_id == user_id,
+                GuardrailVariant.is_deleted == True,
+            )
+        )
+        variant = result.scalar_one_or_none()
         if not variant:
-            return False
+            return None
 
-        await self.db.delete(variant)
+        variant.is_deleted = False
+        variant.deleted_at = None
+        variant.deleted_by = None
         await self.db.commit()
-        return True
+        await self.db.refresh(variant)
+        return variant
 
     async def get_active_variant_for_generation(
         self, generation_id: UUID, user_id: str

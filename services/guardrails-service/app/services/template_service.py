@@ -12,7 +12,7 @@ from app.templates.registry import (
     validate_template_key,
     TemplateNotFoundError,
 )
-from app.templates.base import GuardrailStrategy
+from app.templates.base import GuardrailStrategy, InvalidParameterError
 
 
 class TemplateService:
@@ -72,6 +72,27 @@ class TemplateService:
         """
         return validate_template_key(template_key)
 
+    def validate_parameters(
+        self,
+        template_key: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Validate parameters for a specific template.
+
+        Args:
+            template_key: Template to validate against
+            parameters: Parameters to validate
+
+        Returns:
+            tuple[bool, Optional[str]]: (is_valid, error_message)
+
+        Raises:
+            TemplateNotFoundError: If template doesn't exist
+        """
+        template = get_template(template_key)
+        return template.validate_parameters(parameters or {})
+
     def build_guardrail(
         self,
         template_key: str,
@@ -80,6 +101,8 @@ class TemplateService:
     ) -> str:
         """
         Build a guardrail using the specified template.
+
+        Parameters are validated before building.
 
         Args:
             template_key: Template to use
@@ -91,10 +114,14 @@ class TemplateService:
 
         Raises:
             TemplateNotFoundError: If template doesn't exist
+            InvalidParameterError: If parameters fail validation
         """
         template = get_template(template_key)
-        params = parameters or {}
-        return template.build_guardrail(user_context, **params)
+
+        # Validate and get params with defaults
+        validated_params = template.get_validated_params(parameters)
+
+        return template.build_guardrail(user_context, **validated_params)
 
     def preview_guardrail(
         self,

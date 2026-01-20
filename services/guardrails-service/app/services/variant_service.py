@@ -60,6 +60,9 @@ class VariantService:
         """
         Create a new variant from a generation.
 
+        Variant creation and history logging are done atomically within
+        a single transaction.
+
         Args:
             request: Variant creation request
 
@@ -69,39 +72,51 @@ class VariantService:
         Raises:
             GenerationNotFoundError: If generation doesn't exist or access denied
         """
-        # Verify generation exists and belongs to user
-        generation = await self.generation_repo.get_by_id_and_user(
-            UUID(request.generation_id), request.user_id
-        )
-        if not generation:
-            raise GenerationNotFoundError(UUID(request.generation_id))
+        try:
+            # Verify generation exists and belongs to user
+            generation = await self.generation_repo.get_by_id_and_user(
+                UUID(request.generation_id), request.user_id
+            )
+            if not generation:
+                raise GenerationNotFoundError(UUID(request.generation_id))
 
-        # Use generation's content if custom content not provided
-        guardrail_content = request.guardrail_content or generation.generated_guardrail
+            # Use generation's content if custom content not provided
+            guardrail_content = request.guardrail_content or generation.generated_guardrail
 
-        # Create variant
-        variant = await self.variant_repo.create(
-            generation_id=UUID(request.generation_id),
-            user_id=request.user_id,
-            name=request.name,
-            description=request.description,
-            guardrail_content=guardrail_content,
-            status=request.status or VariantStatus.DRAFT,
-            tags=request.tags,
-            metadata=request.metadata,
-        )
+            # Create variant with explicit version (within transaction)
+            variant = await self.variant_repo.create_with_version(
+                generation_id=UUID(request.generation_id),
+                user_id=request.user_id,
+                name=request.name,
+                description=request.description,
+                guardrail_content=guardrail_content,
+                version=1,
+                status=request.status or VariantStatus.DRAFT,
+                tags=request.tags,
+                metadata=request.metadata,
+            )
 
-        # Log creation in history
-        await self.history_repo.log_creation(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            content=guardrail_content,
-            version=1,
-            status=variant.status,
-            metadata=request.metadata,
-        )
+            # Log creation in history (within same transaction)
+            await self.history_repo.log_creation(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                content=guardrail_content,
+                version=1,
+                status=variant.status,
+                metadata=request.metadata,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except GenerationNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def get_variant(
         self, variant_id: UUID, user_id: str
@@ -167,6 +182,9 @@ class VariantService:
         This follows the versioning principle: never update existing records,
         always create new versions. The source variant remains unchanged.
 
+        Uses SELECT FOR UPDATE to prevent race conditions when multiple
+        requests try to create new versions simultaneously.
+
         Args:
             source_variant_id: Source variant UUID to create new version from
             request: New version request with updated content
@@ -177,57 +195,72 @@ class VariantService:
         Raises:
             VariantNotFoundError: If source variant doesn't exist or access denied
         """
-        # Get source variant
-        source_variant = await self.variant_repo.get_by_id_and_user(source_variant_id, request.user_id)
-        if not source_variant:
-            raise VariantNotFoundError(source_variant_id)
+        try:
+            # Use FOR UPDATE lock to prevent race condition
+            source_variant = await self.variant_repo.get_by_id_and_user_for_update(
+                source_variant_id, request.user_id
+            )
+            if not source_variant:
+                raise VariantNotFoundError(source_variant_id)
 
-        # Determine new version number
-        new_version = source_variant.version + 1
+            # Get max version for this generation (with lock)
+            max_version = await self.variant_repo.get_max_version_for_generation(
+                source_variant.generation_id, request.user_id
+            )
+            new_version = max_version + 1
 
-        # Use provided values or keep from source variant
-        new_name = request.name if request.name else source_variant.name
-        new_description = request.description if request.description is not None else source_variant.description
-        new_content = request.guardrail_content if request.guardrail_content else source_variant.guardrail_content
-        new_tags = request.tags if request.tags is not None else source_variant.tags
-        new_metadata = request.metadata if request.metadata is not None else source_variant.metadata
+            # Use provided values or keep from source variant
+            new_name = request.name if request.name else source_variant.name
+            new_description = request.description if request.description is not None else source_variant.description
+            new_content = request.guardrail_content if request.guardrail_content else source_variant.guardrail_content
+            new_tags = request.tags if request.tags is not None else source_variant.tags
+            new_metadata = request.metadata if request.metadata is not None else source_variant.metadata
 
-        # Create new variant (new record, not update)
-        new_variant = await self.variant_repo.create(
-            generation_id=source_variant.generation_id,
-            user_id=request.user_id,
-            name=new_name,
-            description=new_description,
-            guardrail_content=new_content,
-            status=source_variant.status,  # Keep same status
-            tags=new_tags,
-            metadata=new_metadata,
-        )
+            # Create new variant with explicit version (within same transaction)
+            new_variant = await self.variant_repo.create_with_version(
+                generation_id=source_variant.generation_id,
+                user_id=request.user_id,
+                name=new_name,
+                description=new_description,
+                guardrail_content=new_content,
+                version=new_version,
+                status=source_variant.status,
+                tags=new_tags,
+                metadata=new_metadata,
+            )
 
-        # Manually set version (override default version=1)
-        new_variant.version = new_version
-        await self.db.commit()
-        await self.db.refresh(new_variant)
+            # Log creation of new version in history (within same transaction)
+            await self.history_repo.log_update(
+                variant_id=new_variant.id,
+                user_id=request.user_id,
+                old_content=source_variant.guardrail_content,
+                new_content=new_content,
+                old_version=source_variant.version,
+                new_version=new_version,
+                change_summary=request.change_summary or f"Created new version from v{source_variant.version}",
+                metadata={"source_variant_id": str(source_variant_id)},
+            )
 
-        # Log creation of new version in history
-        await self.history_repo.log_update(
-            variant_id=new_variant.id,
-            user_id=request.user_id,
-            old_content=source_variant.guardrail_content,
-            new_content=new_content,
-            old_version=source_variant.version,
-            new_version=new_version,
-            change_summary=request.change_summary or f"Created new version from v{source_variant.version}",
-            metadata={"source_variant_id": str(source_variant_id)},
-        )
+            # Commit both variant creation and history atomically
+            await self.db.commit()
+            await self.db.refresh(new_variant)
 
-        return self._to_response(new_variant)
+            return self._to_response(new_variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def set_variant_active(
         self, variant_id: UUID, request: SetVariantActiveRequest
     ) -> GuardrailVariantResponse:
         """
         Activate or deactivate a variant.
+
+        State change and history logging are done atomically within
+        a single transaction.
 
         Args:
             variant_id: Variant UUID
@@ -239,28 +272,43 @@ class VariantService:
         Raises:
             VariantNotFoundError: If variant doesn't exist or access denied
         """
-        # Get variant
-        variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
-        if not variant:
-            raise VariantNotFoundError(variant_id)
+        try:
+            # Get variant
+            variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
+            if not variant:
+                raise VariantNotFoundError(variant_id)
 
-        # Update active state
-        variant = await self.variant_repo.set_active(variant, request.is_active)
+            # Update active state (flush, don't commit)
+            variant.is_active = request.is_active
+            await self.db.flush()
 
-        # Log activation/deactivation
-        await self.history_repo.log_activation(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            activated=request.is_active,
-        )
+            # Log activation/deactivation (within same transaction)
+            await self.history_repo.log_activation(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                activated=request.is_active,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def set_variant_status(
         self, variant_id: UUID, request: SetVariantStatusRequest
     ) -> GuardrailVariantResponse:
         """
         Change variant status.
+
+        State change and history logging are done atomically within
+        a single transaction.
 
         Args:
             variant_id: Variant UUID
@@ -272,26 +320,38 @@ class VariantService:
         Raises:
             VariantNotFoundError: If variant doesn't exist or access denied
         """
-        # Get variant
-        variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
-        if not variant:
-            raise VariantNotFoundError(variant_id)
+        try:
+            # Get variant
+            variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
+            if not variant:
+                raise VariantNotFoundError(variant_id)
 
-        # Store old status for history
-        old_status = variant.status
+            # Store old status for history
+            old_status = variant.status
 
-        # Update status
-        variant = await self.variant_repo.set_status(variant, request.status)
+            # Update status (flush, don't commit)
+            variant.status = request.status
+            await self.db.flush()
 
-        # Log status change
-        await self.history_repo.log_status_change(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            old_status=old_status,
-            new_status=request.status,
-        )
+            # Log status change (within same transaction)
+            await self.history_repo.log_status_change(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                old_status=old_status,
+                new_status=request.status,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def delete_variant(self, variant_id: UUID, user_id: str) -> bool:
         """

@@ -53,6 +53,9 @@ class GuardrailGeneration(Base):
 
     This is the output of applying a guardrail template with specific parameters.
     It represents a single guardrail generation that can be used or customized.
+
+    Uses soft delete to preserve audit trail - records are marked as deleted
+    rather than physically removed.
     """
     __tablename__ = "guardrail_generations"
 
@@ -64,6 +67,11 @@ class GuardrailGeneration(Base):
     parameters = Column(JSON, nullable=True)  # Template-specific parameters
     metadata = Column(JSON, nullable=True)  # Additional metadata
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Soft delete fields
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by = Column(String(255), nullable=True)
 
     # Relationships
     variants = relationship(
@@ -82,6 +90,9 @@ class GuardrailVariant(Base):
 
     Variants allow users to customize and save specific versions of guardrails.
     Each update creates a new version, maintaining a complete history.
+
+    Uses soft delete to preserve audit trail - records are marked as deleted
+    rather than physically removed.
     """
     __tablename__ = "guardrail_variants"
 
@@ -107,6 +118,11 @@ class GuardrailVariant(Base):
     metadata = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Soft delete fields
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by = Column(String(255), nullable=True)
 
     # Relationships
     generation = relationship("GuardrailGeneration", back_populates="variants")

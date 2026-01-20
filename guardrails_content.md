@@ -1,5 +1,5 @@
 # File Contents Collection
-Generated: 2026-01-19 10:38:45.979085
+Generated: 2026-01-20 04:09:23.318040
 
 
 ## Directory: services/guardrails-service
@@ -1191,6 +1191,9 @@ class GuardrailGeneration(Base):
 
     This is the output of applying a guardrail template with specific parameters.
     It represents a single guardrail generation that can be used or customized.
+
+    Uses soft delete to preserve audit trail - records are marked as deleted
+    rather than physically removed.
     """
     __tablename__ = "guardrail_generations"
 
@@ -1202,6 +1205,11 @@ class GuardrailGeneration(Base):
     parameters = Column(JSON, nullable=True)  # Template-specific parameters
     metadata = Column(JSON, nullable=True)  # Additional metadata
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Soft delete fields
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by = Column(String(255), nullable=True)
 
     # Relationships
     variants = relationship(
@@ -1220,6 +1228,9 @@ class GuardrailVariant(Base):
 
     Variants allow users to customize and save specific versions of guardrails.
     Each update creates a new version, maintaining a complete history.
+
+    Uses soft delete to preserve audit trail - records are marked as deleted
+    rather than physically removed.
     """
     __tablename__ = "guardrail_variants"
 
@@ -1245,6 +1256,11 @@ class GuardrailVariant(Base):
     metadata = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Soft delete fields
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by = Column(String(255), nullable=True)
 
     # Relationships
     generation = relationship("GuardrailGeneration", back_populates="variants")
@@ -1611,12 +1627,29 @@ class BatchGenerateRequest(UserRequest):
     )
 
 
+class BatchItemResult(BaseModel):
+    """Result of a single item in batch generation."""
+    index: int = Field(..., description="Index of this item in the original request list")
+    success: bool = Field(..., description="Whether this item was processed successfully")
+    result: Optional[GuardrailGenerationResponse] = Field(
+        default=None, description="Generation result (if successful)"
+    )
+    error: Optional[str] = Field(
+        default=None, description="Error message (if failed)"
+    )
+    error_type: Optional[str] = Field(
+        default=None, description="Error type/category (if failed)"
+    )
+
+
 class BatchGenerateResponse(BaseModel):
-    """Response for batch generation."""
-    results: List[GuardrailGenerationResponse]
-    total: int
-    successful: int
-    failed: int
+    """Response for batch generation with per-item tracking."""
+    results: List[BatchItemResult] = Field(
+        ..., description="Results for each item, preserving original order"
+    )
+    total: int = Field(..., description="Total number of items in request")
+    successful: int = Field(..., description="Number of successful items")
+    failed: int = Field(..., description="Number of failed items")
 
 
 # ============================================================================
@@ -1688,6 +1721,7 @@ Repository for GuardrailGeneration CRUD operations.
 Handles database access for guardrail generations.
 """
 
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 from sqlalchemy import select, func
@@ -1765,6 +1799,8 @@ class GenerationRepository:
         """
         Get a generation by ID and user (for access control).
 
+        Excludes soft-deleted records.
+
         Args:
             generation_id: Generation UUID
             user_id: User ID
@@ -1776,6 +1812,7 @@ class GenerationRepository:
             select(GuardrailGeneration).where(
                 GuardrailGeneration.id == generation_id,
                 GuardrailGeneration.user_id == user_id,
+                GuardrailGeneration.is_deleted == False,
             )
         )
         return result.scalar_one_or_none()
@@ -1786,6 +1823,7 @@ class GenerationRepository:
         page: int = 1,
         page_size: int = 20,
         template_key: Optional[str] = None,
+        include_deleted: bool = False,
     ) -> tuple[List[GuardrailGeneration], int]:
         """
         List generations for a user with pagination and filtering.
@@ -1795,12 +1833,17 @@ class GenerationRepository:
             page: Page number (1-indexed)
             page_size: Number of items per page
             template_key: Optional template key filter
+            include_deleted: Whether to include soft-deleted records (default False)
 
         Returns:
             tuple: (list of generations, total count)
         """
         # Build query
         query = select(GuardrailGeneration).where(GuardrailGeneration.user_id == user_id)
+
+        # Exclude soft-deleted by default
+        if not include_deleted:
+            query = query.where(GuardrailGeneration.is_deleted == False)
 
         if template_key:
             query = query.where(GuardrailGeneration.template_key == template_key)
@@ -1822,9 +1865,58 @@ class GenerationRepository:
 
         return list(items), total
 
-    async def delete(self, generation_id: UUID) -> bool:
+    async def delete(self, generation_id: UUID, deleted_by: Optional[str] = None) -> bool:
         """
-        Delete a generation.
+        Soft delete a generation (mark as deleted, don't physically remove).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            generation_id: Generation UUID
+            deleted_by: User ID who performed the deletion
+
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        generation = await self.get_by_id(generation_id)
+        if not generation:
+            return False
+
+        generation.is_deleted = True
+        generation.deleted_at = datetime.utcnow()
+        generation.deleted_by = deleted_by
+        await self.db.commit()
+        return True
+
+    async def delete_by_user(self, generation_id: UUID, user_id: str) -> bool:
+        """
+        Soft delete a generation (user-scoped for access control).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            generation_id: Generation UUID
+            user_id: User ID (also recorded as deleted_by)
+
+        Returns:
+            bool: True if deleted, False if not found or access denied
+        """
+        generation = await self.get_by_id_and_user(generation_id, user_id)
+        if not generation:
+            return False
+
+        generation.is_deleted = True
+        generation.deleted_at = datetime.utcnow()
+        generation.deleted_by = user_id
+        await self.db.commit()
+        return True
+
+    async def hard_delete(self, generation_id: UUID) -> bool:
+        """
+        Permanently delete a generation (use with caution - for admin/cleanup only).
+
+        WARNING: This permanently removes the record and cannot be undone.
+        Use soft delete (delete_by_user) for normal operations.
 
         Args:
             generation_id: Generation UUID
@@ -1840,24 +1932,34 @@ class GenerationRepository:
         await self.db.commit()
         return True
 
-    async def delete_by_user(self, generation_id: UUID, user_id: str) -> bool:
+    async def restore(self, generation_id: UUID, user_id: str) -> Optional[GuardrailGeneration]:
         """
-        Delete a generation (user-scoped for access control).
+        Restore a soft-deleted generation.
 
         Args:
             generation_id: Generation UUID
-            user_id: User ID
+            user_id: User ID for access control
 
         Returns:
-            bool: True if deleted, False if not found or access denied
+            Optional[GuardrailGeneration]: Restored generation or None if not found
         """
-        generation = await self.get_by_id_and_user(generation_id, user_id)
+        result = await self.db.execute(
+            select(GuardrailGeneration).where(
+                GuardrailGeneration.id == generation_id,
+                GuardrailGeneration.user_id == user_id,
+                GuardrailGeneration.is_deleted == True,
+            )
+        )
+        generation = result.scalar_one_or_none()
         if not generation:
-            return False
+            return None
 
-        await self.db.delete(generation)
+        generation.is_deleted = False
+        generation.deleted_at = None
+        generation.deleted_by = None
         await self.db.commit()
-        return True
+        await self.db.refresh(generation)
+        return generation
 
     async def count_by_user(self, user_id: str, template_key: Optional[str] = None) -> int:
         """
@@ -2227,6 +2329,7 @@ Repository for GuardrailVariant CRUD operations.
 Handles database access for guardrail variants with versioning.
 """
 
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 from sqlalchemy import select, func, or_
@@ -2291,6 +2394,55 @@ class VariantRepository:
         await self.db.refresh(variant)
         return variant
 
+    async def create_with_version(
+        self,
+        generation_id: UUID,
+        user_id: str,
+        name: str,
+        guardrail_content: str,
+        version: int,
+        description: Optional[str] = None,
+        status: VariantStatus = VariantStatus.DRAFT,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[dict] = None,
+    ) -> GuardrailVariant:
+        """
+        Create a new guardrail variant with explicit version number.
+
+        Use this method within a transaction that has already locked
+        to get the next version number (prevents race conditions).
+
+        Args:
+            generation_id: ID of the parent generation
+            user_id: ID of the user creating the variant
+            name: Variant name
+            guardrail_content: Guardrail content
+            version: Explicit version number
+            description: Optional description
+            status: Initial status
+            tags: Optional tags
+            metadata: Additional metadata
+
+        Returns:
+            GuardrailVariant: Created variant instance (not committed)
+        """
+        variant = GuardrailVariant(
+            generation_id=generation_id,
+            user_id=user_id,
+            name=name,
+            description=description,
+            guardrail_content=guardrail_content,
+            version=version,
+            is_active=True,
+            status=status,
+            tags=tags,
+            metadata=metadata,
+        )
+        self.db.add(variant)
+        # Don't commit here - let the caller manage the transaction
+        await self.db.flush()
+        return variant
+
     async def get_by_id(self, variant_id: UUID) -> Optional[GuardrailVariant]:
         """
         Get a variant by ID.
@@ -2327,6 +2479,56 @@ class VariantRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_id_and_user_for_update(
+        self, variant_id: UUID, user_id: str
+    ) -> Optional[GuardrailVariant]:
+        """
+        Get a variant by ID and user with row-level lock (FOR UPDATE).
+
+        Use this method when creating new versions to prevent race conditions.
+        The lock is held until the transaction commits/rollbacks.
+
+        Args:
+            variant_id: Variant UUID
+            user_id: User ID
+
+        Returns:
+            Optional[GuardrailVariant]: Variant if found and belongs to user, None otherwise
+        """
+        result = await self.db.execute(
+            select(GuardrailVariant)
+            .where(
+                GuardrailVariant.id == variant_id,
+                GuardrailVariant.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def get_max_version_for_generation(
+        self, generation_id: UUID, user_id: str
+    ) -> int:
+        """
+        Get the maximum version number for a generation (with lock).
+
+        Args:
+            generation_id: Generation UUID
+            user_id: User ID
+
+        Returns:
+            int: Maximum version number, 0 if no variants exist
+        """
+        result = await self.db.execute(
+            select(func.max(GuardrailVariant.version))
+            .where(
+                GuardrailVariant.generation_id == generation_id,
+                GuardrailVariant.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        max_version = result.scalar_one_or_none()
+        return max_version or 0
+
     async def list_by_user(
         self,
         user_id: str,
@@ -2336,6 +2538,8 @@ class VariantRepository:
         status: Optional[VariantStatus] = None,
         is_active: Optional[bool] = None,
         tags: Optional[List[str]] = None,
+        tags_match: str = "any",
+        include_deleted: bool = False,
     ) -> tuple[List[GuardrailVariant], int]:
         """
         List variants for a user with pagination and filtering.
@@ -2347,13 +2551,19 @@ class VariantRepository:
             generation_id: Optional generation ID filter
             status: Optional status filter
             is_active: Optional active state filter
-            tags: Optional tags filter (matches any tag)
+            tags: Optional tags filter
+            tags_match: "any" (OR logic) or "all" (AND logic)
+            include_deleted: Whether to include soft-deleted records
 
         Returns:
             tuple: (list of variants, total count)
         """
         # Build query
         query = select(GuardrailVariant).where(GuardrailVariant.user_id == user_id)
+
+        # Exclude soft-deleted by default
+        if not include_deleted:
+            query = query.where(GuardrailVariant.is_deleted == False)
 
         if generation_id:
             query = query.where(GuardrailVariant.generation_id == generation_id)
@@ -2365,11 +2575,16 @@ class VariantRepository:
             query = query.where(GuardrailVariant.is_active == is_active)
 
         if tags:
-            # Match any of the provided tags (JSON array overlap)
-            tag_conditions = [
-                GuardrailVariant.tags.contains([tag]) for tag in tags
-            ]
-            query = query.where(or_(*tag_conditions))
+            if tags_match == "all":
+                # AND logic - must have ALL tags
+                for tag in tags:
+                    query = query.where(GuardrailVariant.tags.contains([tag]))
+            else:
+                # OR logic (default) - have ANY of the tags
+                tag_conditions = [
+                    GuardrailVariant.tags.contains([tag]) for tag in tags
+                ]
+                query = query.where(or_(*tag_conditions))
 
         # Get total count
         count_query = select(func.count()).select_from(query.subquery())
@@ -2471,9 +2686,58 @@ class VariantRepository:
         await self.db.refresh(variant)
         return variant
 
-    async def delete(self, variant_id: UUID) -> bool:
+    async def delete(self, variant_id: UUID, deleted_by: Optional[str] = None) -> bool:
         """
-        Delete a variant.
+        Soft delete a variant (mark as deleted, don't physically remove).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            variant_id: Variant UUID
+            deleted_by: User ID who performed the deletion
+
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        variant = await self.get_by_id(variant_id)
+        if not variant:
+            return False
+
+        variant.is_deleted = True
+        variant.deleted_at = datetime.utcnow()
+        variant.deleted_by = deleted_by
+        await self.db.commit()
+        return True
+
+    async def delete_by_user(self, variant_id: UUID, user_id: str) -> bool:
+        """
+        Soft delete a variant (user-scoped for access control).
+
+        Preserves the record for audit trail while hiding it from normal queries.
+
+        Args:
+            variant_id: Variant UUID
+            user_id: User ID (also recorded as deleted_by)
+
+        Returns:
+            bool: True if deleted, False if not found or access denied
+        """
+        variant = await self.get_by_id_and_user(variant_id, user_id)
+        if not variant:
+            return False
+
+        variant.is_deleted = True
+        variant.deleted_at = datetime.utcnow()
+        variant.deleted_by = user_id
+        await self.db.commit()
+        return True
+
+    async def hard_delete(self, variant_id: UUID) -> bool:
+        """
+        Permanently delete a variant (use with caution - for admin/cleanup only).
+
+        WARNING: This permanently removes the record and cannot be undone.
+        Use soft delete (delete_by_user) for normal operations.
 
         Args:
             variant_id: Variant UUID
@@ -2489,24 +2753,34 @@ class VariantRepository:
         await self.db.commit()
         return True
 
-    async def delete_by_user(self, variant_id: UUID, user_id: str) -> bool:
+    async def restore(self, variant_id: UUID, user_id: str) -> Optional[GuardrailVariant]:
         """
-        Delete a variant (user-scoped for access control).
+        Restore a soft-deleted variant.
 
         Args:
             variant_id: Variant UUID
-            user_id: User ID
+            user_id: User ID for access control
 
         Returns:
-            bool: True if deleted, False if not found or access denied
+            Optional[GuardrailVariant]: Restored variant or None if not found
         """
-        variant = await self.get_by_id_and_user(variant_id, user_id)
+        result = await self.db.execute(
+            select(GuardrailVariant).where(
+                GuardrailVariant.id == variant_id,
+                GuardrailVariant.user_id == user_id,
+                GuardrailVariant.is_deleted == True,
+            )
+        )
+        variant = result.scalar_one_or_none()
         if not variant:
-            return False
+            return None
 
-        await self.db.delete(variant)
+        variant.is_deleted = False
+        variant.deleted_at = None
+        variant.deleted_by = None
         await self.db.commit()
-        return True
+        await self.db.refresh(variant)
+        return variant
 
     async def get_active_variant_for_generation(
         self, generation_id: UUID, user_id: str
@@ -2588,7 +2862,10 @@ Guardrail Service - orchestrates guardrail generation and management.
 Coordinates between templates, LLM, and database repositories.
 """
 
-from typing import List, Optional, Dict, Any
+import re
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Tuple
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2598,11 +2875,22 @@ from app.models.schemas import (
     GuardrailGenerationResponse,
     CompareTemplatesRequest,
     TemplateComparisonResult,
+    BatchItemResult,
 )
 from app.repositories.generation_repository import GenerationRepository
 from app.services.template_service import TemplateService
 from app.services.llm_service import LLMService
 from app.templates.registry import TemplateNotFoundError
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TemplateSelectionResult:
+    """Result of auto template selection."""
+    template_key: str
+    was_fallback: bool
+    fallback_reason: Optional[str] = None
 
 
 class GuardrailService:
@@ -2625,26 +2913,69 @@ class GuardrailService:
         self.template_service = TemplateService()
         self.llm_service = LLMService()
 
+    def _parse_template_key(self, response: str, valid_keys: List[str]) -> Optional[str]:
+        """
+        Extract template key from LLM response with fuzzy matching.
+
+        Handles various response formats:
+        - Clean key: "content_safety"
+        - With quotes: "content_safety" or 'content_safety'
+        - Markdown bold: **content_safety**
+        - With explanation: "I recommend content_safety because..."
+        - Numbered: "1. content_safety"
+        - Dashes: "content-safety" -> "content_safety"
+
+        Args:
+            response: Raw LLM response
+            valid_keys: List of valid template keys
+
+        Returns:
+            Optional[str]: Matched template key or None
+        """
+        # Clean response
+        cleaned = response.strip().lower()
+        cleaned = re.sub(r'["\'\*\.\,\:\d\[\]\(\)]', '', cleaned)  # Remove punctuation
+        cleaned = cleaned.replace('-', '_')  # Normalize dashes to underscores
+
+        # Direct match
+        if cleaned in valid_keys:
+            return cleaned
+
+        # Check if any valid key is contained in the cleaned response
+        for key in valid_keys:
+            if key in cleaned:
+                return key
+
+        # Try matching with dashes replaced
+        for key in valid_keys:
+            if key.replace('_', '-') in response.lower():
+                return key
+
+        return None
+
     async def _auto_select_template(
         self,
         user_context: str,
         instruction: Optional[str] = None
-    ) -> str:
+    ) -> TemplateSelectionResult:
         """
         Use LLM to automatically select the best template based on context.
+
+        Returns a TemplateSelectionResult that includes:
+        - template_key: The selected (or fallback) template key
+        - was_fallback: Whether fallback was used
+        - fallback_reason: Explanation if fallback was used
 
         Args:
             user_context: User-provided context
             instruction: Optional detailed instruction for template selection
 
         Returns:
-            str: Selected template key
-
-        Raises:
-            Exception: If LLM call fails
+            TemplateSelectionResult: Selection result with fallback info
         """
         # Get all available templates
         templates = self.template_service.list_all_templates()
+        valid_keys = [t['key'] for t in templates]
 
         # Build template descriptions for LLM
         template_descriptions = "\n".join([
@@ -2652,7 +2983,7 @@ class GuardrailService:
             for t in templates
         ])
 
-        # Build selection prompt
+        # Build selection prompt with strict format requirement
         selection_prompt = f"""You are an expert guardrail template selector. Based on the user's context and requirements, select the MOST APPROPRIATE guardrail template.
 
 Available Templates:
@@ -2670,32 +3001,53 @@ Analyze the user's needs carefully and consider:
 4. Regulatory requirements if mentioned
 5. The specific goal the user wants to achieve
 
-Respond with ONLY the template key (e.g., "content_safety", "pii_protection", "factual_accuracy", "tone_control", or "compliance").
-Do not include any explanation, just the key."""
+IMPORTANT: Respond with EXACTLY one of these keys, nothing else:
+{', '.join(valid_keys)}
+
+Your response must be a single word from the list above."""
 
         # Call LLM to select template
         try:
-            selected_key = await self.llm_service.generate(
+            raw_response = await self.llm_service.generate(
                 prompt=selection_prompt,
-                temperature=0.3,  # Low temperature for consistent selection
-                max_tokens=50
+                temperature=0.1,  # Lower temperature for more deterministic results
+                max_tokens=20  # Shorter to prevent explanation
             )
 
-            # Clean the response
-            selected_key = selected_key.strip().lower().replace('"', '').replace("'", "")
+            # Parse the response with robust matching
+            selected_key = self._parse_template_key(raw_response, valid_keys)
 
-            # Validate the selected key
-            if not self.template_service.validate_template_key(selected_key):
-                # Fallback to content_safety if LLM returns invalid key
-                print(f"Warning: LLM selected invalid key '{selected_key}', falling back to 'content_safety'")
-                selected_key = "content_safety"
+            if selected_key:
+                return TemplateSelectionResult(
+                    template_key=selected_key,
+                    was_fallback=False,
+                    fallback_reason=None
+                )
+            else:
+                logger.warning(
+                    f"LLM returned unparseable response: '{raw_response[:100]}', "
+                    "falling back to 'content_safety'"
+                )
+                return TemplateSelectionResult(
+                    template_key="content_safety",
+                    was_fallback=True,
+                    fallback_reason=f"LLM returned unparseable response: '{raw_response[:50]}...'"
+                )
 
-            return selected_key
-
+        except TimeoutError:
+            logger.error("LLM request timeout during template selection")
+            return TemplateSelectionResult(
+                template_key="content_safety",
+                was_fallback=True,
+                fallback_reason="LLM request timeout"
+            )
         except Exception as e:
-            # On any error, fallback to content_safety
-            print(f"Error in auto template selection: {e}, falling back to 'content_safety'")
-            return "content_safety"
+            logger.error(f"Error in auto template selection: {type(e).__name__}: {e}")
+            return TemplateSelectionResult(
+                template_key="content_safety",
+                was_fallback=True,
+                fallback_reason=f"LLM error: {type(e).__name__}"
+            )
 
     async def generate_guardrail(
         self, request: GenerateGuardrailRequest
@@ -2712,24 +3064,42 @@ Do not include any explanation, just the key."""
 
         Returns:
             GuardrailGenerationResponse: Generated guardrail information
+            (includes fallback info in metadata if auto mode was used)
 
         Raises:
             TemplateNotFoundError: If template doesn't exist (manual mode)
             ValueError: If mode is invalid or required fields missing
         """
+        # Prepare metadata with mode information
+        metadata = request.metadata or {}
+        metadata["mode"] = request.mode
+
         # Determine template key based on mode
         if request.mode == "auto":
             # Auto mode: Use LLM to select best template
-            template_key = await self._auto_select_template(
+            selection_result = await self._auto_select_template(
                 user_context=request.user_context,
                 instruction=request.instruction
             )
+            template_key = selection_result.template_key
+
+            # Include fallback info in metadata (user can see if fallback occurred)
+            metadata.update({
+                "auto_selected": True,
+                "selected_template_key": template_key,
+                "was_fallback": selection_result.was_fallback,
+            })
+            if selection_result.fallback_reason:
+                metadata["fallback_reason"] = selection_result.fallback_reason
+            if request.instruction:
+                metadata["instruction"] = request.instruction
         else:
             # Manual mode: Use user-provided template_key
             template_key = request.template_key
             # Validate template exists
             if not self.template_service.validate_template_key(template_key):
                 raise TemplateNotFoundError(template_key)
+            metadata["auto_selected"] = False
 
         # Build guardrail using selected template
         generated_guardrail = self.template_service.build_guardrail(
@@ -2737,17 +3107,6 @@ Do not include any explanation, just the key."""
             user_context=request.user_context,
             parameters=request.parameters,
         )
-
-        # Prepare metadata with mode information
-        metadata = request.metadata or {}
-        metadata.update({
-            "mode": request.mode,
-            "auto_selected": request.mode == "auto",
-        })
-        if request.mode == "auto":
-            metadata["selected_template_key"] = template_key
-            if request.instruction:
-                metadata["instruction"] = request.instruction
 
         # Save to database
         generation = await self.generation_repo.create(
@@ -2865,29 +3224,75 @@ Do not include any explanation, just the key."""
 
     async def batch_generate(
         self, requests: List[GenerateGuardrailRequest]
-    ) -> tuple[List[GuardrailGenerationResponse], int, int]:
+    ) -> Tuple[List[BatchItemResult], int, int]:
         """
-        Generate multiple guardrails at once.
+        Generate multiple guardrails at once with per-item error tracking.
+
+        Each item in the result list corresponds to the same index in the
+        input requests list, allowing users to easily identify which
+        request succeeded or failed.
 
         Args:
             requests: List of generation requests
 
         Returns:
-            tuple: (successful results, successful count, failed count)
+            tuple: (list of BatchItemResult, successful count, failed count)
         """
         results = []
         successful = 0
         failed = 0
 
-        for request in requests:
+        for index, request in enumerate(requests):
             try:
                 result = await self.generate_guardrail(request)
-                results.append(result)
+                results.append(BatchItemResult(
+                    index=index,
+                    success=True,
+                    result=result,
+                    error=None,
+                    error_type=None
+                ))
                 successful += 1
-            except Exception:
-                # Log error in production
+            except TemplateNotFoundError as e:
+                logger.warning(f"Batch item {index} failed: template not found - {e}")
+                results.append(BatchItemResult(
+                    index=index,
+                    success=False,
+                    result=None,
+                    error=str(e),
+                    error_type="template_not_found"
+                ))
                 failed += 1
-                continue
+            except ValueError as e:
+                logger.warning(f"Batch item {index} failed: validation error - {e}")
+                results.append(BatchItemResult(
+                    index=index,
+                    success=False,
+                    result=None,
+                    error=str(e),
+                    error_type="validation_error"
+                ))
+                failed += 1
+            except TimeoutError as e:
+                logger.error(f"Batch item {index} failed: timeout - {e}")
+                results.append(BatchItemResult(
+                    index=index,
+                    success=False,
+                    result=None,
+                    error="LLM request timeout",
+                    error_type="timeout"
+                ))
+                failed += 1
+            except Exception as e:
+                logger.error(f"Batch item {index} failed: {type(e).__name__} - {e}")
+                results.append(BatchItemResult(
+                    index=index,
+                    success=False,
+                    result=None,
+                    error=str(e),
+                    error_type=type(e).__name__
+                ))
+                failed += 1
 
         return results, successful, failed
 
@@ -3316,7 +3721,7 @@ from app.templates.registry import (
     validate_template_key,
     TemplateNotFoundError,
 )
-from app.templates.base import GuardrailStrategy
+from app.templates.base import GuardrailStrategy, InvalidParameterError
 
 
 class TemplateService:
@@ -3376,6 +3781,27 @@ class TemplateService:
         """
         return validate_template_key(template_key)
 
+    def validate_parameters(
+        self,
+        template_key: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Validate parameters for a specific template.
+
+        Args:
+            template_key: Template to validate against
+            parameters: Parameters to validate
+
+        Returns:
+            tuple[bool, Optional[str]]: (is_valid, error_message)
+
+        Raises:
+            TemplateNotFoundError: If template doesn't exist
+        """
+        template = get_template(template_key)
+        return template.validate_parameters(parameters or {})
+
     def build_guardrail(
         self,
         template_key: str,
@@ -3384,6 +3810,8 @@ class TemplateService:
     ) -> str:
         """
         Build a guardrail using the specified template.
+
+        Parameters are validated before building.
 
         Args:
             template_key: Template to use
@@ -3395,10 +3823,14 @@ class TemplateService:
 
         Raises:
             TemplateNotFoundError: If template doesn't exist
+            InvalidParameterError: If parameters fail validation
         """
         template = get_template(template_key)
-        params = parameters or {}
-        return template.build_guardrail(user_context, **params)
+
+        # Validate and get params with defaults
+        validated_params = template.get_validated_params(parameters)
+
+        return template.build_guardrail(user_context, **validated_params)
 
     def preview_guardrail(
         self,
@@ -3506,6 +3938,9 @@ class VariantService:
         """
         Create a new variant from a generation.
 
+        Variant creation and history logging are done atomically within
+        a single transaction.
+
         Args:
             request: Variant creation request
 
@@ -3515,39 +3950,51 @@ class VariantService:
         Raises:
             GenerationNotFoundError: If generation doesn't exist or access denied
         """
-        # Verify generation exists and belongs to user
-        generation = await self.generation_repo.get_by_id_and_user(
-            UUID(request.generation_id), request.user_id
-        )
-        if not generation:
-            raise GenerationNotFoundError(UUID(request.generation_id))
+        try:
+            # Verify generation exists and belongs to user
+            generation = await self.generation_repo.get_by_id_and_user(
+                UUID(request.generation_id), request.user_id
+            )
+            if not generation:
+                raise GenerationNotFoundError(UUID(request.generation_id))
 
-        # Use generation's content if custom content not provided
-        guardrail_content = request.guardrail_content or generation.generated_guardrail
+            # Use generation's content if custom content not provided
+            guardrail_content = request.guardrail_content or generation.generated_guardrail
 
-        # Create variant
-        variant = await self.variant_repo.create(
-            generation_id=UUID(request.generation_id),
-            user_id=request.user_id,
-            name=request.name,
-            description=request.description,
-            guardrail_content=guardrail_content,
-            status=request.status or VariantStatus.DRAFT,
-            tags=request.tags,
-            metadata=request.metadata,
-        )
+            # Create variant with explicit version (within transaction)
+            variant = await self.variant_repo.create_with_version(
+                generation_id=UUID(request.generation_id),
+                user_id=request.user_id,
+                name=request.name,
+                description=request.description,
+                guardrail_content=guardrail_content,
+                version=1,
+                status=request.status or VariantStatus.DRAFT,
+                tags=request.tags,
+                metadata=request.metadata,
+            )
 
-        # Log creation in history
-        await self.history_repo.log_creation(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            content=guardrail_content,
-            version=1,
-            status=variant.status,
-            metadata=request.metadata,
-        )
+            # Log creation in history (within same transaction)
+            await self.history_repo.log_creation(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                content=guardrail_content,
+                version=1,
+                status=variant.status,
+                metadata=request.metadata,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except GenerationNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def get_variant(
         self, variant_id: UUID, user_id: str
@@ -3613,6 +4060,9 @@ class VariantService:
         This follows the versioning principle: never update existing records,
         always create new versions. The source variant remains unchanged.
 
+        Uses SELECT FOR UPDATE to prevent race conditions when multiple
+        requests try to create new versions simultaneously.
+
         Args:
             source_variant_id: Source variant UUID to create new version from
             request: New version request with updated content
@@ -3623,57 +4073,72 @@ class VariantService:
         Raises:
             VariantNotFoundError: If source variant doesn't exist or access denied
         """
-        # Get source variant
-        source_variant = await self.variant_repo.get_by_id_and_user(source_variant_id, request.user_id)
-        if not source_variant:
-            raise VariantNotFoundError(source_variant_id)
+        try:
+            # Use FOR UPDATE lock to prevent race condition
+            source_variant = await self.variant_repo.get_by_id_and_user_for_update(
+                source_variant_id, request.user_id
+            )
+            if not source_variant:
+                raise VariantNotFoundError(source_variant_id)
 
-        # Determine new version number
-        new_version = source_variant.version + 1
+            # Get max version for this generation (with lock)
+            max_version = await self.variant_repo.get_max_version_for_generation(
+                source_variant.generation_id, request.user_id
+            )
+            new_version = max_version + 1
 
-        # Use provided values or keep from source variant
-        new_name = request.name if request.name else source_variant.name
-        new_description = request.description if request.description is not None else source_variant.description
-        new_content = request.guardrail_content if request.guardrail_content else source_variant.guardrail_content
-        new_tags = request.tags if request.tags is not None else source_variant.tags
-        new_metadata = request.metadata if request.metadata is not None else source_variant.metadata
+            # Use provided values or keep from source variant
+            new_name = request.name if request.name else source_variant.name
+            new_description = request.description if request.description is not None else source_variant.description
+            new_content = request.guardrail_content if request.guardrail_content else source_variant.guardrail_content
+            new_tags = request.tags if request.tags is not None else source_variant.tags
+            new_metadata = request.metadata if request.metadata is not None else source_variant.metadata
 
-        # Create new variant (new record, not update)
-        new_variant = await self.variant_repo.create(
-            generation_id=source_variant.generation_id,
-            user_id=request.user_id,
-            name=new_name,
-            description=new_description,
-            guardrail_content=new_content,
-            status=source_variant.status,  # Keep same status
-            tags=new_tags,
-            metadata=new_metadata,
-        )
+            # Create new variant with explicit version (within same transaction)
+            new_variant = await self.variant_repo.create_with_version(
+                generation_id=source_variant.generation_id,
+                user_id=request.user_id,
+                name=new_name,
+                description=new_description,
+                guardrail_content=new_content,
+                version=new_version,
+                status=source_variant.status,
+                tags=new_tags,
+                metadata=new_metadata,
+            )
 
-        # Manually set version (override default version=1)
-        new_variant.version = new_version
-        await self.db.commit()
-        await self.db.refresh(new_variant)
+            # Log creation of new version in history (within same transaction)
+            await self.history_repo.log_update(
+                variant_id=new_variant.id,
+                user_id=request.user_id,
+                old_content=source_variant.guardrail_content,
+                new_content=new_content,
+                old_version=source_variant.version,
+                new_version=new_version,
+                change_summary=request.change_summary or f"Created new version from v{source_variant.version}",
+                metadata={"source_variant_id": str(source_variant_id)},
+            )
 
-        # Log creation of new version in history
-        await self.history_repo.log_update(
-            variant_id=new_variant.id,
-            user_id=request.user_id,
-            old_content=source_variant.guardrail_content,
-            new_content=new_content,
-            old_version=source_variant.version,
-            new_version=new_version,
-            change_summary=request.change_summary or f"Created new version from v{source_variant.version}",
-            metadata={"source_variant_id": str(source_variant_id)},
-        )
+            # Commit both variant creation and history atomically
+            await self.db.commit()
+            await self.db.refresh(new_variant)
 
-        return self._to_response(new_variant)
+            return self._to_response(new_variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def set_variant_active(
         self, variant_id: UUID, request: SetVariantActiveRequest
     ) -> GuardrailVariantResponse:
         """
         Activate or deactivate a variant.
+
+        State change and history logging are done atomically within
+        a single transaction.
 
         Args:
             variant_id: Variant UUID
@@ -3685,28 +4150,43 @@ class VariantService:
         Raises:
             VariantNotFoundError: If variant doesn't exist or access denied
         """
-        # Get variant
-        variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
-        if not variant:
-            raise VariantNotFoundError(variant_id)
+        try:
+            # Get variant
+            variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
+            if not variant:
+                raise VariantNotFoundError(variant_id)
 
-        # Update active state
-        variant = await self.variant_repo.set_active(variant, request.is_active)
+            # Update active state (flush, don't commit)
+            variant.is_active = request.is_active
+            await self.db.flush()
 
-        # Log activation/deactivation
-        await self.history_repo.log_activation(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            activated=request.is_active,
-        )
+            # Log activation/deactivation (within same transaction)
+            await self.history_repo.log_activation(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                activated=request.is_active,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def set_variant_status(
         self, variant_id: UUID, request: SetVariantStatusRequest
     ) -> GuardrailVariantResponse:
         """
         Change variant status.
+
+        State change and history logging are done atomically within
+        a single transaction.
 
         Args:
             variant_id: Variant UUID
@@ -3718,26 +4198,38 @@ class VariantService:
         Raises:
             VariantNotFoundError: If variant doesn't exist or access denied
         """
-        # Get variant
-        variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
-        if not variant:
-            raise VariantNotFoundError(variant_id)
+        try:
+            # Get variant
+            variant = await self.variant_repo.get_by_id_and_user(variant_id, request.user_id)
+            if not variant:
+                raise VariantNotFoundError(variant_id)
 
-        # Store old status for history
-        old_status = variant.status
+            # Store old status for history
+            old_status = variant.status
 
-        # Update status
-        variant = await self.variant_repo.set_status(variant, request.status)
+            # Update status (flush, don't commit)
+            variant.status = request.status
+            await self.db.flush()
 
-        # Log status change
-        await self.history_repo.log_status_change(
-            variant_id=variant.id,
-            user_id=request.user_id,
-            old_status=old_status,
-            new_status=request.status,
-        )
+            # Log status change (within same transaction)
+            await self.history_repo.log_status_change(
+                variant_id=variant.id,
+                user_id=request.user_id,
+                old_status=old_status,
+                new_status=request.status,
+            )
 
-        return self._to_response(variant)
+            # Commit both changes atomically
+            await self.db.commit()
+            await self.db.refresh(variant)
+
+            return self._to_response(variant)
+
+        except VariantNotFoundError:
+            raise
+        except Exception as e:
+            await self.db.rollback()
+            raise
 
     async def delete_variant(self, variant_id: UUID, user_id: str) -> bool:
         """
@@ -3879,7 +4371,15 @@ All guardrail templates must inherit from GuardrailStrategy.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple, List
+
+
+class InvalidParameterError(Exception):
+    """Raised when a parameter fails validation."""
+
+    def __init__(self, message: str, parameter: Optional[str] = None):
+        self.parameter = parameter
+        super().__init__(message)
 
 
 class GuardrailStrategy(ABC):
@@ -3928,6 +4428,91 @@ class GuardrailStrategy(ABC):
             dict: Parameter definitions with types and descriptions
         """
         return {}
+
+    def validate_parameters(self, params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """
+        Validate parameters against the defined schema.
+
+        Checks:
+        - Unknown parameters (not in schema)
+        - Type validation (string, array, etc.)
+        - Enum validation (must be one of allowed values)
+        - Required vs optional parameters
+
+        Args:
+            params: Parameters to validate
+
+        Returns:
+            Tuple[bool, Optional[str]]: (is_valid, error_message)
+        """
+        schema = self.get_parameters()
+
+        for key, value in params.items():
+            if key not in schema:
+                return False, f"Unknown parameter: '{key}'. Valid parameters: {list(schema.keys())}"
+
+            param_schema = schema[key]
+            param_type = param_schema.get("type")
+
+            # Type validation
+            if param_type == "string":
+                if not isinstance(value, str):
+                    return False, f"Parameter '{key}' must be a string, got {type(value).__name__}"
+            elif param_type == "array":
+                if not isinstance(value, list):
+                    return False, f"Parameter '{key}' must be an array, got {type(value).__name__}"
+                # Validate array item types if specified
+                item_type = param_schema.get("items", {}).get("type")
+                if item_type == "string":
+                    for i, item in enumerate(value):
+                        if not isinstance(item, str):
+                            return False, f"Parameter '{key}[{i}]' must be a string, got {type(item).__name__}"
+            elif param_type == "boolean":
+                if not isinstance(value, bool):
+                    return False, f"Parameter '{key}' must be a boolean, got {type(value).__name__}"
+            elif param_type == "integer":
+                if not isinstance(value, int) or isinstance(value, bool):
+                    return False, f"Parameter '{key}' must be an integer, got {type(value).__name__}"
+            elif param_type == "number":
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return False, f"Parameter '{key}' must be a number, got {type(value).__name__}"
+
+            # Enum validation
+            if "enum" in param_schema and value not in param_schema["enum"]:
+                return False, f"Parameter '{key}' must be one of {param_schema['enum']}, got '{value}'"
+
+        return True, None
+
+    def get_validated_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Validate parameters and return them with defaults applied.
+
+        Args:
+            params: Parameters provided by user (can be None)
+
+        Returns:
+            Dict[str, Any]: Validated parameters with defaults
+
+        Raises:
+            InvalidParameterError: If validation fails
+        """
+        params = params or {}
+        schema = self.get_parameters()
+
+        # Validate provided params
+        is_valid, error = self.validate_parameters(params)
+        if not is_valid:
+            raise InvalidParameterError(error)
+
+        # Apply defaults for missing parameters
+        result = {}
+        for key, param_schema in schema.items():
+            if key in params:
+                result[key] = params[key]
+            elif "default" in param_schema:
+                result[key] = param_schema["default"]
+
+        return result
 
 ```
 ==================================================
@@ -4626,7 +5211,7 @@ Implements the Factory pattern for guardrail creation.
 """
 
 from typing import Dict, List
-from app.templates.base import GuardrailStrategy
+from app.templates.base import GuardrailStrategy, InvalidParameterError
 from app.templates.content_safety import ContentSafetyStrategy
 from app.templates.pii_protection import PIIProtectionStrategy
 from app.templates.factual_accuracy import FactualAccuracyStrategy
