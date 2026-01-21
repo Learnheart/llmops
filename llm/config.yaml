@@ -1,0 +1,50 @@
+# Model Configuration
+# Định nghĩa tất cả models available trong hệ thống
+
+models:
+  llm:
+    qwen-0.5b:
+      path: "/app/models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+      model_type: "qwen"
+      context_length: 4096
+      n_threads: 4
+      tags: ["fast", "lightweight", "general"]
+      description: "Qwen 2.5 0.5B - Fast and lightweight for simple tasks"
+
+    # Thêm models khác ở đây khi cần
+    # llama-3-8b:
+    #   path: "/app/models/llm/llama-3-8b-instruct.Q4_K_M.gguf"
+    #   model_type: "llama"
+    #   context_length: 8192
+    #   n_threads: 4
+    #   tags: ["balanced", "general", "multilingual"]
+    #   description: "Llama 3 8B - Balanced performance and quality"
+
+    # mistral-7b:
+    #   path: "/app/models/llm/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+    #   model_type: "mistral"
+    #   context_length: 8192
+    #   n_threads: 4
+    #   tags: ["reasoning", "code", "accurate"]
+    #   description: "Mistral 7B - Good for reasoning and code tasks"
+
+  embedding:
+    minilm:
+      path: "/app/models/embedding/all-MiniLM-L6-v2"
+      dimension: 384
+      tags: ["fast", "lightweight", "general"]
+      description: "MiniLM L6 - Fast embedding for general use"
+
+    # bge-large:
+    #   path: "/app/models/embedding/bge-large-en-v1.5"
+    #   dimension: 1024
+    #   tags: ["accurate", "english"]
+    #   description: "BGE Large - High quality English embeddings"
+
+defaults:
+  llm: "qwen-0.5b"
+  embedding: "minilm"
+
+resource_limits:
+  max_loaded_llm: 2
+  max_loaded_embedding: 2

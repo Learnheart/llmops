@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python test/test_llm.py:*)",
+      "Bash(git ls-tree:*)"
+    ],
+    "additionalDirectories": [
+      "c:\\Projects\\LLMOps_v2"
+    ]
+  }
+}

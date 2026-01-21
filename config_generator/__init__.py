@@ -1,0 +1,1 @@
+"""Config Generator module."""
