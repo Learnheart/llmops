@@ -3,7 +3,8 @@
     "allow": [
       "Bash(pip install:*)",
       "Bash(python test/test_llm.py:*)",
-      "Bash(git ls-tree:*)"
+      "Bash(git ls-tree:*)",
+      "Bash(del \"c:\\\\Projects\\\\LLMOps_v2\\\\rag\\\\minio_client.py\")"
     ],
     "additionalDirectories": [
       "c:\\Projects\\LLMOps_v2"

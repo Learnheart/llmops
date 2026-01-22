@@ -1,8 +1,10 @@
-"""Adapter factory and base interface."""
+"""Adapters for external sources."""
 
 from abc import ABC, abstractmethod
 from typing import Iterator
 from schema.rag import RemoteFile
+
+_ADAPTERS: dict[str, type["BaseAdapter"]] = {}
 
 
 class BaseAdapter(ABC):
@@ -20,10 +22,6 @@ class BaseAdapter(ABC):
     @abstractmethod
     def download_file(self, remote_file: RemoteFile) -> bytes:
         pass
-
-
-# Registry
-_ADAPTERS: dict[str, type[BaseAdapter]] = {}
 
 
 def register_adapter(source_type: str):

@@ -1,4 +1,4 @@
-"""MinIO client for SSOT storage."""
+"""MinIO connection."""
 
 import os
 from minio import Minio
@@ -6,7 +6,7 @@ from io import BytesIO
 
 
 class MinioClient:
-    """Client để tương tác với MinIO"""
+    """Client để tương tác với MinIO."""
 
     def __init__(self):
         self._client: Minio | None = None

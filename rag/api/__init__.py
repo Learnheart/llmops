@@ -1,4 +1,4 @@
-"""API router aggregation."""
+"""API routers."""
 
 from fastapi import APIRouter
 from rag.api.documents import router as documents_router
