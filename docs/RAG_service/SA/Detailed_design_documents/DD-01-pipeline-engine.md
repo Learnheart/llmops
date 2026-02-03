@@ -73,14 +73,74 @@ Pipeline Engine chịu trách nhiệm:
 
 Hệ thống sử dụng **Config-as-Pipeline** pattern, cho phép user định nghĩa pipeline behavior thông qua JSON configuration. Config được lưu trong PostgreSQL và gửi kèm message vào queue.
 
+### 2.0 Knowledge Base Creation Flow (Prerequisite)
+
+**Quan trọng:** Pipeline Config chỉ được tạo SAU KHI Knowledge Base đã tồn tại. Flow tạo KB như sau:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        KNOWLEDGE BASE CREATION FLOW                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  User Input                                                                      │
+│  {                                                                               │
+│    "name": "Company Policies",          ← User nhập                             │
+│    "description": "Internal policies",  ← User nhập (optional)                  │
+│    "permission_type": "custom"          ← User chọn                             │
+│  }                                                                               │
+│       │                                                                          │
+│       ▼                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                     SYSTEM GENERATES                                     │    │
+│  │                                                                          │    │
+│  │  kb_id = UUID()  // e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890"        │    │
+│  │  owner_id = current_user.id                                             │    │
+│  │  tenant_id = current_user.tenant_id                                     │    │
+│  │  status = "active"                                                      │    │
+│  │  created_at = NOW()                                                     │    │
+│  │                                                                          │    │
+│  │  // Optionally create default pipeline configs                          │    │
+│  │  default_ingestion_pipeline = create_default_ingestion_config(kb_id)    │    │
+│  │  default_retrieval_pipeline = create_default_retrieval_config(kb_id)    │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                          │
+│       ▼                                                                          │
+│  KB Record in PostgreSQL                                                         │
+│  {                                                                               │
+│    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",  ← System generated           │
+│    "name": "Company Policies",                                                  │
+│    "tenant_id": "tenant_001",                                                   │
+│    "owner_id": "user_001",                                                      │
+│    "status": "active",                                                          │
+│    "active_ingestion_pipeline_id": "pipeline_001",                             │
+│    "active_retrieval_pipeline_id": "pipeline_002"                              │
+│  }                                                                               │
+│       │                                                                          │
+│       ▼                                                                          │
+│  User có thể:                                                                    │
+│  1. Upload documents (sử dụng default pipeline)                                 │
+│  2. Customize pipeline config (update ingestion/retrieval config)               │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Lifecycle:**
+1. **Create KB** → System generate `kb_id`, create default pipeline configs
+2. **Configure Pipeline** (optional) → User customize pipeline cho KB đã tồn tại
+3. **Upload Documents** → Documents được process bằng active pipeline config của KB
+
 ### 2.1 Ingestion Pipeline Config
+
+**Note:** Các trường `pipeline_id`, `kb_id`, `version`, `created_at` được **system tự động generate** khi user save config. User chỉ configure các settings bên dưới (parser, chunker, embedding, indexing).
 
 ```json
 {
-  "pipeline_id": "ingestion_pipeline_001",
-  "kb_id": "kb_001",
-  "version": "1.0",
-  "created_at": "2026-02-02T10:00:00Z",
+  "pipeline_id": "ingestion_pipeline_001",  // System generated
+  "kb_id": "kb_001",                         // System assigned (from KB being configured)
+  "version": "1.0",                          // System managed
+  "created_at": "2026-02-02T10:00:00Z",      // System generated
+
+  // === USER CONFIGURABLE SETTINGS BELOW ===
 
   "parser": {
     "pdf": {
@@ -215,13 +275,17 @@ Hệ thống sử dụng **Config-as-Pipeline** pattern, cho phép user định 
 
 ### 2.2 Retrieval Pipeline Config
 
+**Note:** Tương tự Ingestion Config, các trường `pipeline_id`, `kb_id`, `version` được system generate.
+
 **Semantic Search Configuration:**
 
 ```json
 {
-  "pipeline_id": "retrieval_pipeline_001",
-  "kb_id": "kb_001",
-  "version": "1.0",
+  "pipeline_id": "retrieval_pipeline_001",  // System generated
+  "kb_id": "kb_001",                         // System assigned
+  "version": "1.0",                          // System managed
+
+  // === USER CONFIGURABLE SETTINGS BELOW ===
 
   "prompt_processing": {
     "enabled": false,
@@ -253,9 +317,11 @@ Hệ thống sử dụng **Config-as-Pipeline** pattern, cho phép user định 
 
 ```json
 {
-  "pipeline_id": "retrieval_pipeline_002",
-  "kb_id": "kb_001",
-  "version": "1.0",
+  "pipeline_id": "retrieval_pipeline_002",  // System generated
+  "kb_id": "kb_001",                         // System assigned
+  "version": "1.0",                          // System managed
+
+  // === USER CONFIGURABLE SETTINGS BELOW ===
 
   "prompt_processing": {
     "enabled": true,
@@ -290,43 +356,77 @@ Hệ thống sử dụng **Config-as-Pipeline** pattern, cho phép user định 
 
 ### 2.3 Config Validation Rules
 
+#### When Creating/Updating Pipeline Config
+
+Pipeline config được tạo/cập nhật cho một KB đã tồn tại. Validation diễn ra ở 2 thời điểm:
+
+**Context quan trọng:**
+- `kb_id` KHÔNG phải là field user nhập — nó được reference từ KB đã tồn tại
+- User chỉ configure các settings (parser, chunker, embedding, etc.)
+- System tự attach `kb_id` vào config dựa trên KB mà user đang configure
+
 | Rule | Validation | Error Message |
 |------|------------|---------------|
-| **Required Fields** | `kb_id`, `embedding.model` must exist | "Missing required field: {field}" |
+| **KB Reference** | `kb_id` must reference an existing, active KB | "Knowledge Base not found or inactive: {kb_id}" |
+| **KB Ownership** | User must have `builder` permission on the KB | "Insufficient permission to configure this KB" |
+| **Required Config Fields** | `embedding.model` must be specified | "Missing required field: embedding.model" |
 | **Dimension Consistency** | All embedding models must have same dimension within a KB | "Embedding dimension mismatch: expected {dim1}, got {dim2}" |
 | **Search Type** | Must be one of: `semantic`, `keyword`, `hybrid` | "Invalid search type: {type}" |
 | **Weight Range** | `vector_weight` + `keyword_weight` must equal 1.0 for hybrid | "Hybrid search weights must sum to 1.0" |
 | **Top-K Constraint** | `reranking.top_k` <= `search.top_k` | "Reranking top_k cannot exceed search top_k" |
 | **Model Existence** | Referenced models must be registered in system | "Unknown model: {model_name}" |
 
-**Validation Flow:**
+#### When Processing (Runtime Validation)
+
+Khi worker nhận job từ queue, validation bổ sung:
+
+| Rule | Validation | Error Message |
+|------|------------|---------------|
+| **Config Version Match** | Pipeline config version phải match với version được reference | "Pipeline config version mismatch" |
+| **KB Still Active** | KB phải còn active (chưa bị xóa) | "Knowledge Base has been deleted" |
+| **Resources Available** | Embedding/LLM endpoints phải accessible | "Service unavailable: {service_name}" |
+
+**Validation Flow (when user saves pipeline config):**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           CONFIG VALIDATION FLOW                                 │
+│                    CONFIG VALIDATION FLOW (Save/Update)                          │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                  │
-│  Input Config                                                                    │
+│  User saves config for KB "Company Policies"                                    │
 │       │                                                                          │
 │       ▼                                                                          │
 │  ┌─────────────────┐                                                            │
-│  │ Schema Validate │── Check JSON structure matches Pydantic schema             │
+│  │ 1. KB Exists?   │── Check KB exists and is active                            │
 │  └────────┬────────┘                                                            │
-│           │                                                                      │
+│           │ ✓ (if not → 404 "KB not found")                                      │
 │           ▼                                                                      │
 │  ┌─────────────────┐                                                            │
-│  │ Field Validate  │── Check required fields, types, ranges                     │
+│  │ 2. Permission?  │── User has builder permission on this KB?                  │
 │  └────────┬────────┘                                                            │
-│           │                                                                      │
+│           │ ✓ (if not → 403 "Insufficient permission")                           │
 │           ▼                                                                      │
 │  ┌─────────────────┐                                                            │
-│  │Cross-Reference  │── Check model exists, dimension consistency                │
+│  │ 3. Schema       │── Check JSON structure matches Pydantic schema             │
 │  │    Validate     │                                                            │
 │  └────────┬────────┘                                                            │
 │           │                                                                      │
 │           ▼                                                                      │
 │  ┌─────────────────┐                                                            │
-│  │ Conflict Detect │── Check incompatible combinations                          │
+│  │ 4. Field        │── Check required config fields, types, ranges              │
+│  │    Validate     │── (embedding.model, chunker settings, etc.)                │
+│  └────────┬────────┘                                                            │
+│           │                                                                      │
+│           ▼                                                                      │
+│  ┌─────────────────┐                                                            │
+│  │ 5. Cross-Ref    │── Check model exists, dimension consistency                │
+│  │    Validate     │                                                            │
+│  └────────┬────────┘                                                            │
+│           │                                                                      │
+│           ▼                                                                      │
+│  ┌─────────────────┐                                                            │
+│  │ 6. Conflict     │── Check incompatible combinations                          │
+│  │    Detect       │── (e.g., hybrid search needs both Milvus and ES)           │
 │  └────────┬────────┘                                                            │
 │           │                                                                      │
 │       ┌───┴───┐                                                                  │
@@ -334,7 +434,16 @@ Hệ thống sử dụng **Config-as-Pipeline** pattern, cho phép user định 
 │     PASS    FAIL                                                                 │
 │       │       │                                                                  │
 │       ▼       ▼                                                                  │
-│   Continue  Return ValidationError                                              │
+│   ┌─────────────────┐                                                           │
+│   │ System assigns: │   Return ValidationError                                  │
+│   │ • pipeline_id   │                                                           │
+│   │ • kb_id (ref)   │                                                           │
+│   │ • version       │                                                           │
+│   │ • created_at    │                                                           │
+│   └─────────────────┘                                                           │
+│       │                                                                          │
+│       ▼                                                                          │
+│   Save to PostgreSQL                                                            │
 │                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
